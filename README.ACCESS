@@ -1,0 +1,32 @@
+As of geektalkd 1.07/1.18, the server now supports access control lists due to
+popular demand.
+
+There are some sample access lists at the bottom of this document.
+
+You specify hosts on Allow and Deny lines.  In order for a host to have access,
+it must appear in the allow list, but NOT in the deny list.  The default state
+is FORBIDDEN.
+
+Allow and Deny lines take multiple arguments in any of these forms:
+
+all
+   All hosts are allowed access.
+A (partial) domain-name
+   Hosts whose names match, or end in, this string are allowed access.
+   Note that this compares whole components:
+      "bar.edu" would NOT match "foobar.edu"
+A full IP address
+   An IP address of a host allowed access.
+A partial IP address
+   The first 1 to 3 bytes of an IP address, for subnet restriction.
+
+SAMPLES:
+-------------------------------
+allow from ncsa.uiuc.edu
+
+All hosts (and ONLY those hosts) in the specified domain are allowed access.
+-------------------------------
+allow from all
+deny from geektalk.org hurrah.com
+
+Everyone EXCEPT *.geektalk.org and *.hurrah.com addresses will be allowed.

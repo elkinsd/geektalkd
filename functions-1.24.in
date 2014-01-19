@@ -1,0 +1,1080 @@
+#!/usr/bin/perl -w
+
+use strict 'vars';
+##@use Net::Ident;
+use vars qw($VERSION $FUNCVERS $FUNCDATE
+				%stats %handles %users
+				$bits $rehash $filenum $order
+				$logging $debug $defaultport $password $codeon $access $aclfile);
+
+# These flags can be accessed from either the %handles hash, or from the %users
+# hash (as soon as a username and hostname have been provided, the values will
+# be placed in %users).  To access a particular flag, use:
+# $handles{<filehandlename>}{<flagname>}
+# or
+# $users{<username>}{<flagname>}
+# i.e. $handles{FILE87}{channel} == $users{plumpy}{channel}
+# FLAG      : definition
+##IDENTIFICATION
+# handle      The name of the filehandle associated with the user.
+#             gethostbyaddr().
+# username    The username (as specified by the user).
+# hostname    The hostname (as specified by the user).
+##CONNECTION INFO
+##@# ident       The result of an identd query on the connection.
+# rhostname   The real hostname (or undef) as returned by gethostbyaddr();
+# ipaddr      The real IP address of the connection.
+# rport       The (remote) port used for the connection.
+##USER SETTINGS
+# channel     The channel the user is currently on.
+# echo        The users' echoing setting (1 or 0)
+# times       The users' timestamp setting (1 or 0)
+# read        Whether or not the user has read permissions.
+# write       Whether or not the user has write permissions.
+# %{ignore}   Users that this user is ignoring.
+#             i.e.: $users{plumpy}{ignore}{meanie}
+#                   $users{plumpy}{ignore}{jerkz}
+##USER SETTINGS
+# spoke       The last time() the user spoke publically.
+# connect     The time the user connected.
+# lines       The number of lines processed for this handle.
+# spoken      The number of lines publically spoken by this handle.
+##SIGNON INFO
+# flag        A value from 0 - 4 indicating:
+#             0: User has just connected.
+#             1: User has sent a username with "u=username" or a hostname with
+#                "h=hostname", but not both.  Awaiting the other part, and then
+#                the flag will be switched to 4.
+#             2: User has issued a /signon command without setting a username.
+#                The user was asked for a username, which we are now awaiting,
+#                and then we will jump to flag 3.
+#             3: User has issued a /signon command without setting a hostname.
+#                The user was asked for a hostname, which we are now awaiting,
+#                and then we will jump to flag 5.
+#             4: User is signed off.
+#             5: User is signed on.
+
+# Catch this bastard signal.
+$SIG{PIPE} = sub {  logmsg("SERVER: SIGPIPE received and promptly ignored.") };
+
+# Some globals.
+$FUNCVERS = "1.24";
+$FUNCDATE = "10-Feb-2003";
+
+# Set these yourself!!!
+# perl -e 'print crypt("password", "m0"), "\n";'
+$password = "rUycwUSRsoKxs" if(!defined $password);
+
+# ***  about()  ***
+# Prints author and copyright info.
+sub about {
+	my $handle = shift;
+	toHandle($handle, "*", " " . dateStr());
+	toHandle($handle, "* Geektalkd version $VERSION");
+	toHandle($handle, "* functions version $FUNCVERS ($FUNCDATE)");
+	toHandle($handle,"* Copyright (C) 1999 Michael Plump <plumpy\@skylab.org>");
+	toHandle($handle, "*");
+}
+
+# ***  broadcastChan()  ***
+# Sends a line of data to every client who is on the current channel.
+sub broadcastChan {
+	my ($handle, $channel, $pretime, $time, $posttime) = @_;
+	foreach my $chandle (keys %handles) {
+		# if the user is in the same channel
+		if($handles{$chandle}{channel} == $channel
+			# and is signed in...
+			&& $handles{$chandle}{flag} == 5
+			# and has read permission (or this is his own message)
+			&& ($handles{$chandle}{read} != 0 || $handle eq $chandle)
+			# and if he is not ignoring the user
+			&& (!exists $handles{$chandle}{ignore}{$handles{$handle}{username}})
+			# and if this is his message and he has echo on
+			&& ($handle ne $chandle || $handles{$chandle}{echo} == 1)) {
+				# then we can send the message!
+				toHandle($chandle,$pretime,$time,$posttime)
+		}
+	}
+}
+
+# ***  broadcastMsg()  ***
+# Sends a line of data to every client who is signed on.
+sub broadcastMsg {
+	my ($pretime, $time, $posttime) = @_;
+	foreach my $chandle (keys %handles) {
+		if($handles{$chandle}{flag} == 5) {
+			toHandle($chandle,$pretime,$time,$posttime)
+		}
+	}
+}
+
+# ***  channel()  ***
+# Accepts a handle and a channel number as arguments, and changes the users
+# Current channel, or prints errors where applicible.
+sub channel {
+	my ($handle, $channel) = @_;
+	if($handles{$handle}{flag} != 5) {
+		notOn($handle);
+	} elsif(!defined $channel) {
+		$channel = $handles{$handle}{channel};
+		toHandle($handle, "", "<".dateStr()."> ",
+					"* You are on channel $channel.");
+	} elsif($channel !~ /^-?\d+$/ || $channel < -2147483648
+			|| $channel > 2147483647 || $channel == 0) {
+		toHandle($handle, "", "<".dateStr()."> ",
+					"* Invalid channel number.");
+	} elsif($channel == $handles{$handle}{channel}) {
+		toHandle($handle, "", "<".dateStr()."> ",
+					"* You are already on channel $channel.");
+	} else {
+		my $oldchannel = $handles{$handle}{channel};
+		my $username = $handles{$handle}{username};
+		my $hostname = $handles{$handle}{hostname};
+		broadcastChan($handle,$channel,"|", dateStr() . " ",
+					"change| $username@$hostname ($username) has joined this "
+					. "channel.");
+		$handles{$handle}{channel} = $channel;
+		broadcastChan($handle,$oldchannel,"|", dateStr() . " ",
+					"change| $username@$hostname ($username) has left this "
+					. "channel.");
+		toHandle($handle, "", "<".dateStr()."> ",
+					"* You are now on channel $channel.");
+	}
+}
+
+# ***  cmd()  ***
+# Pass a command name and a line as arguments.  This function will return true
+# if the line contained the /command.
+sub cmd {
+	my ($cmd, $line) = @_;
+	return 1 if($line =~ /^\/(.+?)\b/ && $1 eq substr($cmd, 0, length($1)));
+}
+
+# ***  dateStr()  ***
+# Constructs and returns a date string in the format hh:mmPM for broadcast to
+# the user.
+sub dateStr {
+	# Patch for perl 5.00404 by Jade Nicoletti <phaethon@phaethon.ch>:
+	my ($min,$hour) = (localtime)[1,2];
+	# End
+	my $apm = "AM";
+	$apm = "PM" if $hour >= 12;
+	$hour -= 12 if $hour > 12;
+	$hour = 12 if $hour == 0;
+	my $datestr = sprintf("%02d:%02d%s", $hour, $min, $apm);
+	return $datestr;
+}
+
+# *** doLoginProcessing()  ***
+# This is called from processInput if the user hasn't set a username and
+# hostname yet (IOW, when the flag < 4).  It steps through the various methods
+# for getting a username and hostname, maintaining both backwards compatibility
+# with chatd and trying to make it a little easier (so if they don't know the
+# proper protocol, they can still set a username with "/signon")
+sub doLoginProcessing {
+	my($handle, $line) = @_;
+	my $temp;
+	if($handles{$handle}{flag} < 2) {
+		if($line =~ /^u=(.*)$/) {
+			$temp = $1;
+			if($temp =~ /^[A-Za-z0-9_\-\.]{1,15}$/) {
+				if(!exists $users{$temp}) {
+					$handles{$handle}{username} = $temp;
+					$users{$temp} = $handles{$handle};
+					$handles{$handle}{flag} = 
+						($handles{$handle}{flag} == 0) ? 1 : 4;
+					logmsg("USER: Handle $handle now has the username $temp.");
+				} else {
+					toHandle($handle, "", "<".dateStr()."> ",
+								"* That username is taken; please specify a new one "
+								. "with \"u=username\".");
+				}
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Invalid username.  Please specify a new one "
+							. "with \"u=username\".");
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Valid usernames are from the set: "
+							. "/^[A-Za-z0-9_\\-\\.]{1,15}\$/");
+			} 
+		} elsif($line =~ /^h=(.*)$/) {
+			$temp = $1;
+			if($temp =~ /^[A-Za-z0-9\-\.]{1,26}$/) {
+				$handles{$handle}{hostname} = $temp;
+				$handles{$handle}{flag} = 
+					($handles{$handle}{flag} == 0) ? 1 : 4;
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Invalid hostname.  Please specify a new "
+							. "one with \"h=hostname\".");
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Valid hostnames are from the set: "
+							. "/^[A-Za-z0-9\\-\\.]{1,26}\$/");
+			}
+		} elsif(cmd("signon", $line)) {
+			my @ARGV = split /\s+/, $line, 3;
+			my $error = 0;
+			if(defined $ARGV[1]) {
+				if($ARGV[1] !~ /^-?\d+$/ || $ARGV[1] < -2147483648
+					|| $ARGV[1] > 2147483647 || $ARGV[1] == 0) {
+					toHandle($handle, "", "<".dateStr()."> ",
+								"* Invalid channel number.");
+					$error = 1;
+				} else {
+						$handles{$handle}{channel} = $ARGV[1];
+				}
+			}
+			if($error == 0) {
+				if(!defined $handles{$handle}{username}) {
+					toHandle($handle, "", "<".dateStr()."> ",
+								"* Please enter a username to signon.");
+					$handles{$handle}{flag} = 2;
+				} elsif(!defined $handles{$handle}{hostname}) {
+					toHandle($handle, "", "<".dateStr()."> ",
+								"* Please enter a hostname to signon.");
+					$handles{$handle}{flag} = 3;
+				}
+			}
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* Use /signon to sign on.");
+		}
+	} elsif($handles{$handle}{flag} == 2) {
+		if($line =~ /^h=(.*)?$/) {
+			$temp = $1;
+			if($temp =~ /^[A-Za-z0-9\-\.]{1,26}$/) {
+				$handles{$handle}{hostname} = $temp;
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Please enter a username to signon.");
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Invalid hostname. Use the set: "
+							. "/^[A-Za-z0-9\\-\\.]{1,26}\$/");
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* Please enter a username to signon.");
+			}
+		} elsif($line =~ /^(u=)?([A-Za-z0-9_\-\.]{1,15})$/) {
+			if(!exists $users{$2}) {
+				$handles{$handle}{username} = $2;
+				$users{$2} = $handles{$handle};
+				logmsg("USER: Handle $handle now has the username $2.");
+				if(defined $handles{$handle}{hostname}) {
+					signon($handles{$handle}{username});
+				} else {
+					$handles{$handle}{flag} = 3;
+					toHandle($handle, "", "<".dateStr()."> ",
+								"* Please enter a hostname to signon.");
+				}
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* That username is taken; please specify another one.");
+			}
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* Invalid username.  Use the set: " .
+						"/^[A-Za-z0-9_\\-\\.]{1,15}\$/");
+		}
+	} elsif($handles{$handle}{flag} == 3) {
+		if($line =~ /^(h=)?([A-Za-z0-9-\.]{1,26})$/) {
+			$handles{$handle}{hostname} = $2;
+			signon($handles{$handle}{username});
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* Invalid hostname.  Use the set: " .
+						"/^[A-Za-z0-9\\-\\.]{1,26}\$/");
+		}
+	}
+}
+
+# ***  echo()  ***
+# Accepts a handle and another argument, and turns echoing on or off.
+sub echo {
+	my ($handle, $boolean) = @_;
+	$boolean = lc($boolean);
+	if($handles{$handle}{flag} != 5) {
+		notOn($handle);
+	} elsif((!defined $boolean || $boolean eq "") && $boolean ne "on"
+				&& $boolean ne "off" && $boolean ne "1" && $boolean ne "0") {
+		if($handles{$handle}{echo} == 0) {
+			$handles{$handle}{echo} = 1;
+			toHandle($handle, "", "<".dateStr()."> ", "* Echoing is now ON.");
+		} else {
+			$handles{$handle}{echo} = 0;
+			toHandle($handle, "", "<".dateStr()."> ", "* Echoing is now OFF.");
+		}
+	} elsif($boolean eq "on" || $boolean eq "1") {
+		$handles{$handle}{echo} = 1;
+		toHandle($handle, "", "<".dateStr()."> ", "* Echoing is now ON.");
+	} elsif($boolean eq "off" || $boolean eq "0") {
+		$handles{$handle}{echo} = 0;
+		toHandle($handle, "", "<".dateStr()."> ", "* Echoing is now OFF.");
+	} else {
+		toHandle($handle, "", "<".dateStr()."> ", "* Invalid argument.");
+	}
+}
+
+# *** getConnect()  ***
+# Called from processClients() whenever incoming activity is detected on the
+# socket.  Opens and set up a new filehandle for an incoming connection.
+sub getConnect {
+	my $paddr;
+	my $fhandle = "FILE" . ++$filenum;
+	$paddr = accept("$fhandle",Server);
+	my($port,$iaddr) = sockaddr_in($paddr);
+	my $name = gethostbyaddr($iaddr,AF_INET);
+	my $ipaddr = inet_ntoa($iaddr);
+##@	my $ident = Net::Ident::lookup($fhandle, 5);
+##@	$ident = "unknown user" if(!defined $ident);
+
+	if(defined $access) {
+		my $allowed = verifyHost($iaddr);
+		if(!$allowed) {
+			toHandle($fhandle, "|geektalkd $FUNCDATE| Access forbidden.");
+			close($fhandle);
+			logmsg("REFUSED CONNECTION",
+##@						"by $ident",
+						"from $name [$ipaddr] at port $port using handle $fhandle.");
+			return;
+		}
+	}
+
+	logmsg("CONNECTION",
+##@				"by $ident",
+				"from $name [$ipaddr] at port $port using handle $fhandle.");
+	toHandle($fhandle, "|geektalkd $FUNCDATE| Type /help for help.");
+	
+	$fhandle->autoflush();
+	$handles{$fhandle}{handle} = $fhandle;
+	$handles{$fhandle}{ipaddr} = $ipaddr;
+	$handles{$fhandle}{rhostname} = $name;
+##@	$handles{$fhandle}{ident} = $ident;
+	$handles{$fhandle}{rport} = $port;
+	$handles{$fhandle}{flag} = 0;
+	$handles{$fhandle}{connect} = time();
+	$handles{$fhandle}{spoke} = time();
+	$handles{$fhandle}{lines} = 0;
+	$handles{$fhandle}{spoken} = 0;
+	$handles{$fhandle}{channel} = 0;
+	$handles{$fhandle}{echo} = 1;
+	$handles{$fhandle}{times} = 1;
+	$handles{$fhandle}{read} = 1;
+	$handles{$fhandle}{write} = 1;
+
+	setbits();
+}
+
+# ***  help()  ***
+# Prints the cheesy help screen.
+sub help {
+	my $handle = shift;
+	toHandle($handle, "*", " " . dateStr());
+	toHandle($handle, "* Geektalk Help:");
+	toHandle($handle, "*   /bye or /quit" .(" " x 21)."quit from geektalk");
+	toHandle($handle, "*   /signon [<channel #>]" .(" " x 13).
+				"signon to geektalk session");
+	toHandle($handle,
+				"*   /signoff" .(" " x 26)."signoff from geektalk session");
+	toHandle($handle, "*   /channel [<channel #>]"
+				.(" " x 12)."show/change channel");
+	toHandle($handle, "*   /invite <user>"
+				.(" " x 20)."invite <user> to your channel");
+	toHandle($handle, "*   /names [<user>]"
+				.(" " x 19)."list users");
+	toHandle($handle, "*   /stats [<user>]"
+				.(" " x 19)."get various statistics");
+	toHandle($handle, "*   /ping <user>".(" " x 22).
+				"send a 'beep' to <user>");
+	toHandle($handle, "*   /tell <user> <msg>".(" " x 16).
+				"send a message to <user>");
+	toHandle($handle, "*   /ignore [<user> [on|off|0|1]]".(" " x 5).
+				"start or stop ignoring a user");
+	toHandle($handle, "*   /times [on|off|1|0]" .(" " x 15).
+				"Turn timestamping of messages on/off");
+	toHandle($handle, "*   /echo [on|off|1|0]" .(" " x 16).
+				"Turn echoing of your own message on/off");
+	toHandle($handle, "*   /me <message>" .(" " x 21).
+				"Do an action (\"/me eats bl00d.\")");
+	toHandle($handle, "*   /nuclear <message>" .(" "x16).
+	         "Print something anonymously");
+        toHandle($handle, "*   /username <username>" .(" "x14).
+                 "Change your username");
+	toHandle($handle, "*");
+}
+
+# ***  ignore()  ***
+# Accepts a user to ignore (or unignore...).
+sub ignore {
+	my ($handle, $user, $boolean) = @_;
+	$boolean = lc($boolean);
+	if(!defined $user || $user eq "") {
+		if(keys(%{$handles{$handle}{ignore}}) == 0) {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* You are not ignoring anyone.");
+		} else {
+			my $ignorelist;
+			foreach(sort {$a cmp $b} keys %{$handles{$handle}{ignore}}) {
+				$ignorelist .= "$_ ";
+			}
+			toHandle($handle, "","<".dateStr()."> ",
+						"* Users you are ignoring: ".$ignorelist);
+		}
+	} elsif($user eq $handles{$handle}{username}) {
+		toHandle($handle, "", "<".dateStr().". ",
+					"* You can not ignore yourself.  Use /echo off.");
+	} elsif(!defined $boolean || $boolean eq "") {
+		if(exists $handles{$handle}{ignore}{$user}) {
+			delete $handles{$handle}{ignore}{$user};
+			toHandle($handle, "","<".dateStr()."> ",
+						"* You are no longer ignoring $user.");
+		} else {
+			$handles{$handle}{ignore}{$user} = 1;
+			toHandle($handle, "","<".dateStr()."> ",
+						"* You are now ignoring $user.");
+		}
+	} elsif($boolean eq "on" || $boolean eq "1") {
+			$handles{$handle}{ignore}{$user} = 1;
+			toHandle($handle, "","<".dateStr()."> ",
+						"* You are now ignoring $user.");
+	} elsif($boolean eq "off" || $boolean eq "0") {
+			delete $handles{$handle}{ignore}{$user};
+			toHandle($handle, "","<".dateStr()."> ",
+						"* You are no longer ignoring $user.");
+	} else {
+		toHandle($handle, "", "<".dateStr()."> ", "* Invalid argument.");
+	}
+}
+
+# ***  initstats()  ***
+# Sets some initial values to 0 in %stats
+sub initstats {
+	$stats{signon} = 0;
+	$stats{lines} = 0;
+	$stats{spoken} = 0;
+	$stats{start} = time();
+}
+
+# ***  invite()  ***
+# Accepts a user to invite from, and a user to invite.
+sub invite {
+	my ($from, $to) = @_;
+	if ($handles{$from}{flag} != 5) {
+		notOn($from);
+	} elsif(!exists $users{$to}) {
+		toHandle($from, "", "<".dateStr()."> ", "* User not found.");
+	} elsif($users{$to}{flag} != 5) {
+		toHandle($from, "", "<".dateStr()."> ", "* User is not signed on.");
+	} else {
+		my $fromname = $handles{$from}{username};
+		my $tohandle = $users{$to}{handle};
+		my $fromchan = $handles{$from}{channel};
+		my $tochan = $users{$to}{channel};
+		if($fromchan == $tochan) {
+			toHandle($from, "", "<".dateStr()."> ",
+				" $to is already on this channel.");
+		} else {
+			toHandle($from, "", "<".dateStr()."> ",
+						"* you invite $to to channel $fromchan.");
+			toHandle($tohandle, "", "<".dateStr()."> ",
+						"\a\a* $fromname invites you to channel $fromchan.");
+		}
+	}
+}
+
+# ***  logmsg()  ***
+# Logs any passed arguments in a standardized format.
+sub logmsg {
+	my ($sec,$min,$hour,$mday,$mon) = localtime;
+	my $monname = ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep",
+			"Oct","Nov","Dec")[$mon];
+	my $datestr = sprintf("%s %2d %02d:%02d:%02d",
+				$monname, $mday, $hour, $min, $sec);
+	print LOG "$datestr geektalkd: @_", "\n" if (defined $logging);
+	print STDERR "$datestr geektalkd: @_", "\n" if (defined $debug);
+}
+
+# ***  nameline()  ***
+# Sends a little info about $user to $handle (for /names and names()
+sub nameline {
+	my ($handle, $user) = @_;
+	my ($you, $idlestr, $namestr, $chanstr, $hostname);
+	$you = " ";
+	$you = ">" if $handle eq $users{$user}{handle};
+	$idlestr = timeDiff($users{$user}{spoke}, time());
+        my $timestr = timeDiff($users{$user}{connect}, time());
+        $hostname = $users{$user}{hostname};
+	if($users{$user}{flag} < 5) {
+		$chanstr = "offline";
+	} elsif($users{$user}{channel} < 0) {
+		$chanstr = "private";
+	} else {
+		$chanstr = $users{$user}{channel};
+	}
+	$namestr = sprintf("* %1s%-10s %-15s %6s %7s %s\@%s", $you,
+		$chanstr, $user, $idlestr, $timestr, $user,
+		$hostname);
+	toHandle($handle,$namestr);
+}
+
+# ***  names()  ***
+# Lists the currently connected users.
+sub names {
+	my ($handle, $name) = @_;
+	my $current = time();
+	my ($you, $idlestr, $namestr, $chanstr);
+	if((!defined $name) || (exists($users{$name}) && $users{$name}{flag} > 3)) {
+		toHandle($handle,"*", " " . dateStr());
+		toHandle($handle,"*  Channel    Username         Idle   Conn'd    UserID\@Node");
+	}
+	if(defined $name) {
+		if(!exists $users{$name} || $users{$name}{flag} < 4) {
+			toHandle($handle, "*", dateStr() . "*", " No such user.");
+		} else {
+			nameline($handle,$name);
+		}
+	} else {
+		foreach my $cuser (sort namesort (keys %users)) {
+			nameline($handle,$cuser) if $users{$cuser}{flag} > 3;
+		}
+	}
+	if((!defined $name) || (exists($users{$name}) && $users{$name}{flag} > 3)) {
+		toHandle($handle, "*");
+	}
+}
+
+sub namesort {
+	$users{$b}{spoke} <=> $users{$a}{spoke}
+		or
+	$users{$a}{username} cmp $users{$b}{username};
+}
+
+# ***  notOn()  ***
+# Prints a standard error message.
+sub notOn {
+	my $handle = shift;
+	toHandle($handle, "", "<".dateStr()."> ", "* You are not signed on.");
+}
+
+# ***  password()  ***
+# Checks to see if the admin password was sent.
+sub password {
+	my $pw = shift;
+	if($password eq crypt($pw, $password)) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+# ***  ping()  ***
+# Accepts a user to ping from, and a user to ping.
+sub ping {
+	my ($from, $to) = @_;
+	if ($handles{$from}{flag} != 5) {
+		notOn($from);
+	} elsif(!exists $users{$to}) {
+		toHandle($from, "", "<".dateStr()."> ", "* User not found.");
+	} elsif($users{$to}{flag} != 5) {
+		toHandle($from, "", "<".dateStr()."> ", "* User is not signed on.");
+	} else {
+		my $fromname = $handles{$from}{username};
+		my $tohandle = $users{$to}{handle};
+		toHandle($from, "", "<".dateStr()."> ", "* You pung $to.");
+		if(!exists $users{$to}{ignore}{$handles{$from}{username}}) {
+			toHandle($tohandle, "", "<".dateStr()."> ",
+						"* $fromname pung \a\ayou!!");
+		}
+	}
+}
+
+# ***  processClients() ***
+# Called from the main loop.  Checks for status on all filehandles. If there is
+# activity on the Server socket, opens a new connection.  Otherwise, reads a
+# line from the active handle, and passes it off for processing to
+# processInput();
+sub processClients {
+	my ($eol, $rout, $chandle, $line, @lines);
+	select($rout=$bits, undef, undef, undef);
+	if(vec($rout, fileno(Server), 1)) {
+		getConnect();
+	} else {
+		foreach $chandle (keys %handles) {
+			if(vec($rout, fileno($chandle), 1)) {
+				sysread($chandle, $line, 512);
+				if(!$line) {
+					removeHandle($chandle);
+				} else {
+					$eol = chomp($line);
+					@lines = split /\n/, $line;
+					if(!$eol) {
+						## you know, it seems that elkinsd came up with this
+						## marvelous idea.
+						if((!exists($handles{$chandle}{glue})) ||
+							length($handles{$chandle}{glue}) < 8192) {
+							$handles{$chandle}{glue} .= pop(@lines);
+						} else {
+							shift(@lines);
+						}
+					} else {
+						if(exists $handles{$chandle}{glue}) {
+							if(length($handles{$chandle}{glue}) < 8192) {
+								$handles{$chandle}{glue} .= shift(@lines);
+							} else {
+								shift(@lines);
+							}
+							processInput($chandle, $handles{$chandle}{glue});
+							delete($handles{$chandle}{glue});
+						}
+					}
+					foreach (@lines) {
+						processInput($chandle, $_);
+					}
+				}
+			}
+		}
+	}
+}
+
+# ***  processInput()  ***
+# Called from processClients when a line of input is read.  Parses the input
+# and passes it off to one of several functions for handling.
+sub processInput {
+	my($handle, $line) = @_;
+	my @ARGV;
+	++$stats{lines};
+	++$handles{$handle}{lines};
+	$line =~ s/[\1-\6\10-\37\177]//g;
+	if($line =~ /^\/reparse\b/) {
+		$rehash = 1;
+		toHandle($handle, "", "<".dateStr()."> ",
+					"* Reparsing functions.  Thank you for playing.");
+	} elsif($line =~ /^\/access\b/) {
+		if(defined $access) {
+			logmsg("ACCESS: Reparsing $aclfile");
+			my @return = parseAccessFile();
+			if($return[0] != 1) {
+				foreach(@return) {
+					toHandle($handle, "", "<".dateStr()."> ", $_);
+					logmsg("ACCESS: $_");
+				}
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* The access control file $aclfile was parsed ".
+							"sucessfully.");
+				logmsg("ACCESS: $aclfile reparsed successfully.");
+			}
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* Access control was not enabled at runtime.  Use the -a ".
+						"option.");
+		}
+	} elsif($line =~ /^\/code\b/) {
+		if(defined $codeon) {
+			@ARGV = split /\s+/, $line, 3;
+			if($password eq crypt($ARGV[1], $password)) {
+				runCode($handle, $ARGV[2]);
+			} else {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"* WRONG PASSWORD, BUCKO.");
+			}
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* /code is disabled in this server.");
+		}
+	} elsif(cmd("help", $line)) {
+		help($handle);
+	} elsif(cmd("bye", $line) || cmd("quit", $line)) {
+		removeHandle($handle);
+	} elsif(cmd("names", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		names($handle, $ARGV[1]);
+	} elsif($line =~ /^\/stats\b/) {
+		@ARGV = split /\s+/, $line, 3;
+		stats($handle, $ARGV[1]);
+	} elsif($line =~ /^\/about\b/) {
+		about($handle);
+	} elsif(cmd("date", $line)) {
+		open(DATE, 'date|');
+		my $date = <DATE>;
+		chomp $date;
+		toHandle($handle, "", "<".dateStr()."> ", "* The date is: ".$date);
+	} elsif($handles{$handle}{flag} < 4) {
+		doLoginProcessing($handle, $line);
+	} elsif(cmd("signon", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		if($handles{$handle}{flag} == 4) {
+			signon($handles{$handle}{username}, $ARGV[1]);
+		} else {
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* You are already signed on.");
+		}
+	} elsif(cmd("signoff", $line)) {
+		if($handles{$handle}{flag} == 5) {
+			signoff($handles{$handle}{username});
+		} else {
+			notOn($handle);
+		}
+	} elsif(cmd("channel", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		channel($handle, $ARGV[1]);
+	} elsif(cmd("echo", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		echo($handle, $ARGV[1]);
+	} elsif(cmd("tell", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		tellcmd($handle, $ARGV[1], $ARGV[2]);
+	} elsif(cmd("times", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		timestamps($handle, $ARGV[1]);
+	} elsif(cmd("ping", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		ping($handle, $ARGV[1]);
+	} elsif(cmd("invite", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+		invite($handle, $ARGV[1]);
+	} elsif(cmd("ignore", $line)) {
+		@ARGV = split /\s+/, $line, 4;
+		ignore($handle, $ARGV[1], $ARGV[2]);
+	} elsif(cmd("me", $line)) {
+		if($handles{$handle}{flag} != 5) {
+			notOn($handle);
+		} else {
+			@ARGV = split /\s+/, $line, 2;
+			$handles{$handle}{spoke} = time();
+			++$stats{spoken};
+			++$handles{$handle}{spoken};
+
+			my $username = $handles{$handle}{username};
+			$ARGV[0] =~ s/^\/me?/$username/;
+
+			if($handles{$handle}{write} == 0) {
+				toHandle($handle, "", "<".dateStr()."> ",
+							"$ARGV[0] " . $ARGV[1]);
+			} else {
+				broadcastChan($handle, $handles{$handle}{channel},
+							"", "<" . dateStr() . "> ",
+							"$ARGV[0] " . $ARGV[1]);
+			}
+		}
+	} elsif(cmd("nuclear", $line)) {
+		if($handles{$handle}{flag} != 5) {
+			notOn($handle);
+		} else {
+			@ARGV = split /\s+/, $line, 2;
+			++$stats{spoken};
+			++$handles{$handle}{spoken};
+			$ARGV[1] =~ s/[<>]//g;
+			if($handles{$handle}{write} == 0) {
+				toHandle($handle, $ARGV[1]);
+			} else {
+				broadcastChan($handle, $handles{$handle}{channel},
+							$ARGV[1]);
+			}
+		}
+    } elsif(cmd("username", $line)) {
+		@ARGV = split /\s+/, $line, 3;
+        username($handle, $ARGV[1]);
+	} elsif($line =~ /^\//) {
+		toHandle($handle, "", "<".dateStr()."> ", "* Invalid command.");
+	} elsif($handles{$handle}{flag} == 5) {
+		$handles{$handle}{spoke} = time();
+		++$stats{spoken};
+		++$handles{$handle}{spoken};
+                my $username = $handles{$handle}{username};
+		if($handles{$handle}{write} == 0) {
+			toHandle($handle, "<", dateStr()." ", "$username> "
+						. $line);
+		} else {
+			broadcastChan($handle, $handles{$handle}{channel},
+						"<", dateStr() . " ", "$username> "
+						. $line);
+		}
+	} else {
+		notOn($handle);
+	}
+}
+
+# ***  removeHandle()  ***
+# Accepts a filehandle name as input and closes that handle, deletes it from
+# the lists of active handles, and logs a message to that effect.
+sub removeHandle {
+	my $handle = shift;
+	my $username = $handles{$handle}{username};
+	my $logmsg = "Removing handle $handle ";
+	if(defined($username)) {
+		$logmsg .= "($username).";
+	} else {
+		$logmsg .= "(no username provided).";
+	}
+	logmsg("USER: $logmsg");
+	signoff($username) if $handles{$handle}{flag} == 5;
+	close $handle;
+	delete $handles{$handle};
+	delete $users{$username} if defined($username);
+	setbits();
+}
+
+# ***  runCode()  ***
+# Runs some arbitrary code sent in.
+sub runCode {
+	my ($handle, $line) = @_;
+		my $logmsg;
+		if(exists $handles{$handle}{username}) {
+			$logmsg = $handles{$handle}{username};
+		} else {
+			$logmsg = $handle;
+		}
+		$logmsg .= " executed the following code: $line";
+		logmsg("CODE: $logmsg");
+		eval "$line";
+}
+
+# ***  serverKill()  ***
+# Shuts down the server quasi-gracefully.
+sub serverKill {
+	logmsg "SERVER: Shutting down.";
+	logmsg "SERVER: Closing incoming socket.";
+	close(Server);
+	broadcastMsg("*", dateStr() . "*", " geektalkd is shutting down.");
+	logmsg "SERVER: Kicking off all users.";
+	foreach(keys %handles) {
+		removeHandle($_);
+	}
+	logmsg "SERVER: Exiting.";
+	exit;
+}
+
+# ***  serverStats()  ***
+# Sends the user stats about the server (called from stats())
+sub serverStats {
+	my $handle = shift;
+	toHandle($handle, "*", " ".dateStr());
+	toHandle($handle, "* Geektalkd Server Statistics:");
+	toHandle($handle, "*   Server version $VERSION");
+	toHandle($handle, "*   Functions version $FUNCVERS ($FUNCDATE)");
+	toHandle($handle,
+				"*   Server started on " . scalar(localtime($stats{start})));
+	my $stat = timeDiff($stats{start}, time(), 1);
+	toHandle($handle, "*   Server running $stat");
+	toHandle($handle, "*   Total number of connections:     $filenum");
+	$stat = keys %handles;
+	toHandle($handle, "*   Current open connections:        $stat");
+	$stat = 0;
+	foreach (keys %users) {
+		++$stat if $users{$_}{flag} > 3;
+	}
+	toHandle($handle, "*   Current users:                   $stat");
+	toHandle($handle, "*   Total number of /signons:        $stats{signon}");
+	toHandle($handle, "*   Total number of lines processed: $stats{lines}");
+	$stat = int($stats{lines}/((time() - $stats{start})/3600));
+	toHandle($handle, "*   Lines processed per hour:        $stat");
+	toHandle($handle, "*   Total number of lines spoken:    $stats{spoken}");
+	$stat = int($stats{spoken}/((time() - $stats{start})/3600));
+	toHandle($handle, "*   Lines spoken per hour:           $stat");
+	toHandle($handle, "*");
+}
+
+# ***  setbits()  ***
+# Accepts a list of filehandles and returns a vector bitstream of those handles
+# for use with select();
+sub setbits {
+	my @fhlist = ("Server", keys %handles);
+	$bits = "";
+	for (@fhlist) {
+		vec($bits, fileno($_), 1) = 1;
+	}
+	return $bits;
+}
+
+# ***  signoff()  ***
+# Signs off a username passed as an argument.
+sub signoff {
+	my $username = shift;
+	broadcastMsg("|", dateStr() . " ",
+				"signoff| $username\@$users{$username}{hostname} ($username)");
+	$users{$username}{flag} = 4;
+	$users{$username}{spoke} = time();
+}
+
+# ***  signon()  ***
+# Signs on a username passed as an argument.
+sub signon {
+	my ($username, $channel) = @_;
+	$users{$username}{flag} = 5;
+	$users{$username}{spoke} = time();
+	++$stats{signon};
+	if(defined $channel) {
+		$users{$username}{channel} = $channel;
+	} elsif($users{$username}{channel} == 0) {
+		$users{$username}{channel} = 1;
+	}
+	broadcastMsg("|", dateStr() . " ",
+				"signon| $username\@$users{$username}{hostname} ($username)");
+}
+
+# ***  stats()  ***
+# Print out some server statistics.
+sub stats {
+	my ($handle, $name) = @_;
+	if(!defined $name) {
+		serverStats($handle);
+	} elsif(!exists $users{$name}) {
+		toHandle($handle, "*", dateStr() . "*", " No such user.");
+	} else {
+		userStats($handle, $name);
+	}
+}
+
+# ***  tellcmd()  ***
+# Accepts a user to tell from, and a user to tell to, and a message.
+sub tellcmd {
+	my ($from, $to, $message) = @_;
+	if ($handles{$from}{flag} != 5) {
+		notOn($from);
+	} elsif(!exists $users{$to}) {
+		toHandle($from, "", "<".dateStr()."> ", "* User not found.");
+	} elsif($users{$to}{flag} != 5) {
+		toHandle($from, "", "<".dateStr()."> ", "* User is not signed on.");
+	} elsif(!defined $message) {
+		toHandle($from, "", "<".dateStr()."> ", "* No message.");
+	} else {
+		my $fromname = $handles{$from}{username};
+		my $tohandle = $users{$to}{handle};
+		toHandle($from, "", "<".dateStr()."> ", "* you tell $to: $message");
+		if(!exists $users{$to}{ignore}{$handles{$from}{username}}) {
+			toHandle($tohandle, "", "<".dateStr()."> ",
+						"\a\a* $fromname tells you: $message");
+		}
+	}
+}
+
+# ***  timeDiff  ***
+# Returns a brief time diference (55d23h || 23h 6m || 54m)
+sub timeDiff {
+   my ($orig, $new, $full) = @_;
+	my $idlestr;
+	my $diff = $new - $orig;
+	my $days = int($diff / 86400);
+	$diff %= 86400;
+	my $hours = int($diff / 3600);
+	$diff %= 3600;
+	my $mins = int($diff / 60);
+	if(defined $full) {
+		return(sprintf("%dd%2dh%2dm", $days, $hours, $mins));
+	} elsif($days > 0) {
+		return(sprintf("%2dd%2dh", $days, $hours));
+	} elsif($hours > 0) {
+		return(sprintf("%2dh%2dm", $hours, $mins));
+	} else {
+		return(sprintf("%2dm", $mins));
+	}
+}
+
+# ***  times()  ***
+# Accepts a handle and another argument, and turns timestamps on or off.
+sub timestamps {
+	my ($handle, $boolean) = @_;
+	$boolean = lc($boolean);
+	if($handles{$handle}{flag} != 5) {
+		notOn($handle);
+	} elsif((!defined $boolean || $boolean eq "") && $boolean ne "on"
+				&& $boolean ne "off" && $boolean ne "1" && $boolean ne "0") {
+		if($handles{$handle}{times} == 0) {
+			$handles{$handle}{times} = 1;
+			toHandle($handle, "", "<".dateStr()."> ", "* Timestamps are now ON.");
+		} else {
+			$handles{$handle}{times} = 0;
+			toHandle($handle, "", "<".dateStr()."> ",
+						"* Timestamps are now OFF.");
+		}
+	} elsif($boolean eq "on" || $boolean eq "1") {
+		$handles{$handle}{times} = 1;
+		toHandle($handle, "", "<".dateStr()."> ", "* Timestamps are now ON.");
+	} elsif($boolean eq "off" || $boolean eq "0") {
+		$handles{$handle}{times} = 0;
+		toHandle($handle, "", "<".dateStr()."> ", "* Timestamps are now OFF.");
+	} else {
+		toHandle($handle, "", "<".dateStr()."> ", "* Invalid argument.");
+	}
+}
+
+# ***  toHandle()  ***
+# Sends a line of data to a specific handle.
+sub toHandle {
+	my ($handle, $pretime, $time, $posttime) = @_;
+	if(defined $time && $handles{$handle}{times} == 1) {
+		$pretime .= $time;
+	}
+	$pretime .= $posttime if(defined $posttime);
+	print $handle $pretime, "\r\n";
+}
+
+sub username {
+	my ($handle, $new) = @_;
+	if($handles{$handle}{flag} < 4) {
+		notOn($handle);
+	} else {
+		my $old = $handles{$handle}{username};
+    if($new eq $old) {
+      toHandle($handle, "", "<".dateStr()."> ", "* That already IS your username!");
+    } elsif(!defined $new || $new eq '') {
+      toHandle($handle, "", "<".dateStr()."> ", "* You must specify a new username.");
+    } elsif($new =~ /^[A-Za-z0-9_\-\.]{1,15}$/) {
+      if(exists $users{$new}) {
+        toHandle($handle, "", "<".dateStr()."> ", "* That username is already taken.");
+      } else {
+        $handles{$handle}{username} = $new;
+        $users{$new} = $handles{$handle};
+        delete $users{$old};
+        if($handles{$handle}{flag} == 5) {
+  	      broadcastMsg("|", dateStr() . "| $old is now known as $new.");
+        }
+      }
+    } else {
+      toHandle($handle, "", "<".dateStr()."> ", '* Invalid username.  Valid usernames are from the set /^[A-Za-z0-9_\-\.]{1,15}$/');
+    }
+  }
+}
+
+# ***  userStats()  ***
+# Sends the user stats about the requested user (called from stats())
+sub userStats {
+	my ($handle, $name) = @_;
+	my $connection = "";
+	toHandle($handle, "*", " ".dateStr());
+	toHandle($handle, "* $name User Statistics:");
+	toHandle($handle, "*   User connected on "
+				. scalar(localtime($users{$name}{connect})));
+	my $stat = timeDiff($users{$name}{connect}, time(), 1);
+	toHandle($handle, "*   User connected $stat");
+##@	$connection = $users{$name}{ident} ?
+##@				"$users{$name}{ident}\@" : "unknown\@";
+	$connection .= $users{$name}{rhostname} ?
+				"$users{$name}{rhostname}:" : "$users{$name}{ipaddr}:";
+	$connection .= "$users{$name}{rport}";
+	toHandle($handle, "*   User connected from $connection");
+	toHandle($handle, "*   User last spoke at "
+				. scalar(localtime($users{$name}{spoke})));
+	$stat = timeDiff($users{$name}{spoke}, time(), 1);
+	toHandle($handle, "*   User is idle $stat");
+	toHandle($handle,
+				"*   Total number of lines processed: $users{$name}{lines}");
+	$stat = int($users{$name}{lines}/((time() - $users{$name}{connect})/3600));
+	toHandle($handle, "*   Lines processed per hour:        $stat");
+	toHandle($handle,
+				"*   Total number of lines spoken:    $users{$name}{spoken}");
+	$stat = int($users{$name}{spoken}/((time() - $users{$name}{connect})/3600));
+	toHandle($handle, "*   Lines spoken per hour:           $stat");
+	if($users{$name}{flag} < 5) {
+		$stat = "offline";
+	} elsif($users{$name}{channel} < 0) {
+		$stat = "private";
+	} else {
+		$stat = $users{$name}{channel};
+	}
+	toHandle($handle, "*   Channel:                         $stat");
+	$stat = $users{$name}{echo} ? "On" : "Off";
+	toHandle($handle, "*   Echoing:                         $stat");
+	$stat = $users{$name}{times} ? "On" : "Off";
+	toHandle($handle, "*   Timestamps:                      $stat");
+	toHandle($handle, "*");
+}

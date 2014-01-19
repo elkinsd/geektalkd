@@ -1,0 +1,135 @@
+#!/usr/bin/perl
+
+use strict;
+use ExtUtils::MakeMaker qw(:DEFAULT prompt);
+use Getopt::Long;
+use Pod::Text;
+use Socket;
+use FileHandle;
+use FindBin qw($Bin);
+
+$| = 1;
+
+my $intro = <<HELP;
+HELP
+
+use vars qw($opt_help $opt_no_ident $opt_prefix $path $no_symlink $sympath $symerr);
+$path = "/usr/local/geektalkd";
+$sympath = "/usr/local/sbin";
+
+# files that need adapting when we install Net::Ident support.
+my @ident_files = qw(functions);
+
+# option processing
+GetOptions("prefix=s" => \$path, "help|?" => \$opt_help,
+			"no-symlink" => \$no_symlink, "symlink-path=s" => \$sympath);
+
+if($opt_help) {
+	print "This is the installer for geektalkd.\n\n";
+	print "You can specify the following options:\n";
+	print "    --prefix=/path/to/install\n";
+	print "        Sets the path where geektald will be installed.\n";
+	print "        Directories will be created as necessary.  The default is\n";
+	print "        /usr/local/geektalkd.\n\n";
+	print "    --no-symlink\n";
+	print "        Do not install a symlink for the binary in /usr/local/sbin\n\n";
+	print "    --symlink-path=/path/to/symlink\n";
+	print "        Install the geektalkd symlink in /path/to/symlink.  The\n";
+	print "        default is /usr/local/sbin.\n";
+	exit;
+}
+
+
+# check if we can install Net::Ident support.
+sub check_ident () {
+	my $forcetxt = <<FORCE;
+You do not have Net::Ident installed, and will be unable to use the ident
+features of geektalkd.  Either install Net::Ident and rerun the installer
+or live without it.
+FORCE
+	print "Checking Net::Ident... ";
+	eval { require Net::Ident };
+	if ( $@ ) {
+		print "Not found.\n\n$forcetxt";
+		return;
+	}
+	if ( !defined($Net::Ident::VERSION) ) {
+		print "no VERSION? assuming Net::Ident not present\n\n$forcetxt";
+		return;
+	}
+	print "found $Net::Ident::VERSION\n";
+	if ( $Net::Ident::VERSION lt '1.20' ) {
+		print "$Net::Ident::VERSION is too old...\n\n$forcetxt";
+		return;
+	} else {
+		return 1;
+	}
+}
+
+# modify files in @ident_files for Net::Ident support
+sub install_ident () {
+	print "Rewriting for Net::Ident mode: @ident_files\n";
+	foreach(@ident_files) {
+		open(READ, "$_.in");
+		open(EDIT, ">$_");
+		while(<READ>) {
+			s/^##@//;
+			print EDIT $_;
+		}
+		close READ;
+		close EDIT;
+	}
+	chmod 0755, @ident_files;
+}
+
+sub remove_ident () {
+	print "Removing Net::Ident support: @ident_files\n";
+	foreach(@ident_files) {
+		open(READ, "$_.in");
+		open(EDIT, ">$_");
+		copy: while(<READ>) {
+			next copy if /^##@/;
+			print EDIT $_;
+		}
+		close READ;
+		close EDIT;
+	}
+	chmod 0755, @ident_files;
+}
+
+if(check_ident) {
+	install_ident;
+} else {
+	remove_ident;
+}
+
+eval {
+	print "\nCreating $path if it doesn't exist.\n";
+	die if(system('install', '-d', $path) != 0);
+	print "Installing scripts into $path\n";
+	die if(system('install', '-m', '0755', 'geektalkd', 'functions', 'access', $path) != 0);
+	if($no_symlink == 0) {
+		print "Creating $sympath if it doesn't exist.\n";
+		die if(system('install', '-d', $sympath) != 0);
+		print "Installing symlink for geektalkd in $sympath.";
+		if(stat("$sympath/geektalkd")) {
+			print "..  file exists!\n";
+		} else {
+			symlink("$path/geektalkd", "$sympath/geektalkd") or die;
+			print "\n";
+		}
+	}
+};
+if($@) {
+	print STDERR "\nAn error occured while doing the above step.  You can\n";
+	print STDERR "either fix the problem and run the install script again,\n";
+	print STDERR "or install it manually (copy geektalkd and functions to\n";
+	print STDERR "the appropriate folder and optionally create a symlink in\n";
+	print STDERR "/usr/local/sbin.)\n\n";
+} else {
+	print "\ngeektalkd was installed properly.\n\n";
+}
+
+print "Thank you for using geektalkd.\n";
+print "Email comments/suggestions/bug reports to plumpy\@skylab.org.\n";
+print "If this is an upgrade, please type /reparse to load the new code.\n";
