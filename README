@@ -1,0 +1,93 @@
+This is geektalkd 1.09, functions version 1.25.  It is a free perl-based chat
+server designed with thin clients in mind.
+
+USAGE
+
+geektalkd [-a] [-c] [-d] [-h] [-l <logfile>] [-p <port>] [-r] [-V]
+   -a <accessfile>: Enable access control.  This uses apache-style
+       control.  See the server documentation.
+   -c: Enable the /code feature, which allows arbitrary code to be
+       run.  This is dangerous, and not of much use unless you know
+       the server's codebase pretty wellwell, so it's off by default.
+       Make sure to change the password in the 'functions' file if
+       you use this!
+   -d: Debug mode.  Logs to stderr and won't fork.
+   -h: Prints this message and exits.
+   -l <logfile>: Logging enabled.
+   -p <port>: Sets the port that the server will run on.
+   -r: Allows the server to be run regardless of uid/gid.
+   -V: Prints version information and exits.
+
+CONNECTING
+
+The simplest way to connect to the server is just to telnet to it.  From the
+box you ran it on, just type "telnet localhost <port>".  The port is 41000 if
+you used the default.
+
+Once connected, type /signon to log into the server or /help to see the help
+files.
+
+There are also special clients avaliable on www.geektalk.org which have their
+own special tweaks.
+
+INSTALLING NEW VERSIONS
+
+You can download new versions of the server from www.geektalk.org.  Because the
+server comes in two parts, it has two version numbers.  The server (geektalkd)
+rarely gets updated, but the functions file gets updated a fair amount
+currently.
+
+The file is at http://www.geektalk.org/geektalkd.tar.gz
+
+Once you download and untar it, simply copy your new geektalkd and functions
+file over the old one, connect to the (already running) server, and type
+/reparse, which will get you all the new functionality from the functions file.
+
+If the geektalkd file has a new version, you'll need to restart the server to
+get that functionality.
+
+HISTORY
+
+The basic server is modeled after an old C-based "chatd" server which came from
+some unknown location, and was used on our local server for chatting between
+users for a long time.  You can download the old chatd from www.geektalk.org.
+
+After using chatd for some time, I began extending it and adding weird new
+commands to it.  This was rather difficult because C isn't exactly the best
+at string processing, and because whenever I added new functions, everyone had
+to be kicked off the server so it could restarted.  That got to be a pain
+because there were about 10 users on our server who use screen(1) to remain
+connected to the server at all times.  The most recent hacked version of chatd
+is also avaliable at www.geektalk.org.
+
+So one day, mostly just to see if I could, I decided to rewrite chatd in perl.
+The main advantages that brings are:
+1) Its much easier to add new functions and change how the server operates,
+   because (in my opinion) perl is better suited for it.
+2) Its possible to issue a /reparse command and reload all the parsing code.
+   This means you can completely change the way the server works on the fly,
+   and without anyone even knowing you did it.
+   (Franklin Johnson <ratty@they.org> actually mentioned that he had this
+	"softboot" functionality in a C-based chat server.  Mind-boggling.)
+3) chatd had a nasty buffer overflow in it, and the server often crashed when
+   users would accidently send data that was too long.
+
+The drawbacks, of course, are:
+1) Speed.  Yeah, its perl.  The good part is that for an application like this,
+   speed doesn't really matter.
+2) Memory.  geektalkd uses about 10x the memory of chatd, but its still only
+   about 1.5-2MB of memory.
+
+geektalkd is currently not really under development, though I fix bugs as
+I find them (they aren't really many...  it's a pretty simple app) and
+I'm always happy to answer questions via email.
+
+BUGS
+
+The code isn't documented.
+
+AUTHORS
+
+geektalkd was written by Michael Plump <plumpy@skylab.org> and maintained David Elkins <elkinsd@hurrah.com>.
+
+It is released under the LGPL v3. Versions 1.24 and earlier were released under the GPL.

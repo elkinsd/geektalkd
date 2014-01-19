@@ -1,0 +1,346 @@
+#!/usr/local/bin/perl
+
+# generic chatd/geektalk/nerdtalk client
+#
+# for more information or comments/suggestions, please email
+# nutts@geektalk.org
+#
+# Copyright (c) 1999, David Elkins (elkinsd@hurrah.com)
+#$Id: nutts,v 1.14 1999/07/28 21:24:57 elkinsd Exp elkinsd $
+
+## nutts can accept arguments as either -----<arg> or +++++<arg>
+## the positive or negative work with/against defaults set in system rc
+## add: -e (execute) to execute the line, for greetings, channels, pings, etc.
+## add: -i (ignore) to ignore users, adds to or subtracts from list. prints
+##	list of users ignore with a certain option, and at startup
+##	uses regex to match the ignored users
+## add: -m (macro) to create/delete macros
+##	_anything you want_ like `canada "Ohhhh Caaaanada."
+##	`<macro> executes
+##	?<macro> lists the macros matching the regex
+## add: -l (listening) to create/delete listeners to execute macro/etc.
+## added: +logging
+## add: logging to print the full date at least once a day.
+##	logging should also create unique logfile names
+## add: command line history
+## add: /version, etc etc etc.
+
+# <<<
+## these should be put into a central rc file for the entire machine
+$username = getlogin();
+$hostname = "hurrah.com";
+
+## was skylab.org:41000, now trying a different ssh forward
+$host = "localhost";
+$port = 42000;
+#$host = "geektalk.org";
+#$port = 41000;
+# >>>
+
+## get all the arguments
+### first check for a $HOME/.nerdtalkrc
+if (-f "$ENV{HOME}/.nerdtalkrc") {
+
+	open(RC,"<$ENV{HOME}/.nerdtalkrc") || die;
+	@largs = <RC>;
+	close(RC);
+
+	# we need to compress the file into seperate args
+	foreach $line (@largs) {
+		if ($line =~ /^#/) {
+			# is it a comment, like me?
+			next;
+		}
+		$line =~ s/\n//g;
+		(@stuff) = split(/ /,$line);
+		push @args,@stuff;
+	}
+}
+
+push @args,@ARGV;
+
+$arg_num = $#args+1;
+while (@args) {
+	$opt = shift(@args);
+	##$opt =~ s/-+//g;
+
+	$copt = shift(@args);
+	if ($copt =~ /^[-+]/) {
+		## this is a one arg arg, heh
+		unshift (@args, $copt);
+		$copt = "";
+	}
+
+	if ($opt =~ /^--+/) {
+		## one type
+
+		if ($arg_num == 1) {
+			($u,$h) = split(/\@/,$opt);
+			if ($u ne "") { $username = $u; }
+			if ($h ne "") { $hostname = $h; }
+		} elsif ($opt =~ /\b(u|user|username)\b/) {
+			($u,$h) = split(/\@/,$copt);
+			if ($u ne "") { $username = $u; }
+			if ($h ne "") { $hostname = $h; }
+		} elsif ($opt =~ /\b(h|host|hostname)\b/) {
+			($h,$p) = split(/\:/,$copt);
+			if ($h ne "") { $host = $h; }
+			if ($p ne "") { $port = $p; }
+		} else {
+			# this assumes that they are all pairs
+			##print "ignoring argument $opt/$copt\n";
+		}
+	} elsif ($opt =~ /^[-+]/) {
+		## another type
+		## 
+		## both of these are on by default
+		($way,$copt) = split(/\b/,$opt);
+		##print "$copt/$way\n";
+
+		if ($opt =~ /\becho\b/) {
+			if ($way eq "-") {
+				$echo = "/echo\n";
+			} else {
+				$echo = "";
+			}
+		}
+
+		if ($opt =~ /\btimestamp\b/) {
+			if ($way eq "-") {
+				$stamp = "/times\n";
+			} else {
+				$stamp = "";
+			}
+		}
+
+		if ($opt =~ /\blogging\b/) {
+			if ($way eq "-") {
+				$logging = "0";
+			} else {
+				$logging = "1";
+			}
+		}
+	
+		if ($opt =~ /\bterm\b/) {
+			if ($way eq "-") {
+				$term = "0";
+			} else {
+				$term = "1";
+			}
+		}
+	} else {
+		## unrecognized argument, ignore
+	}
+}
+
+if (0) {
+	print "$username\@$hostname\n";
+	print "$host:$port\n";
+	print "$echo";
+	print "$stamp";
+} else {	
+	&connect;
+}
+
+###
+# MEAT
+######
+sub connect {
+	use Socket;
+
+	$mypid = $$;
+
+	$SIG{'INT'} = 'dokill';
+
+	sub dokill {kill(9,$child) if $child;}
+
+	$sockaddr = 'S n a4 x8';
+	$iaddr = inet_aton($host);
+	$paddr = sockaddr_in($port, $iaddr);
+
+	socket(S, PF_INET, SOCK_STREAM, $proto) or die "error: socket";
+	connect(S, $paddr) or die "error: connect";
+
+	# Set socket to be command buffered.
+
+	select(S); $| = 1; select(STDOUT);
+
+	if ($logging) {
+		##print "opening log\n";
+		open(LOG,">>$ENV{HOME}/.nerdtalk.log") || die;
+		select(LOG); $|=1; select(STDOUT);
+	}
+
+	# Avoid deadlock by forking
+
+	if ($child = fork) {
+		printf(S "u=%s\nh=%s\n", $username, $hostname);
+		printf(S "/signon\n");
+		printf(S "$echo");
+		printf(S "$stamp");
+
+		while($line = <STDIN>) {
+			if ($line =~ /^\/spoof/) {
+				$line =~ s/\n//g;
+				($cmd,$passwd,$user,@msg) = split(/ /,$line);
+				print S <<EOL;
+/code $passwd broadcastChan(\$users{$user}{handle},\$users{$user}{channel},"<", dateStr()." ", "$user> "."@msg");
+EOL
+			} elsif ($line =~ /^\/morse/) {
+				$line =~ s/\n//g;
+
+				$line =~ /^(.*?) (.*)$/;
+				my $cmd = $1;
+				my $msg = lc($2);
+
+				my %code;
+				$code{"a"} = ".-";
+				$code{"b"} = "-...";
+				$code{"c"} = "-.-.";
+				$code{"d"} = "-..";
+				$code{"e"} = ".";
+				$code{"f"} = "..-.";
+				$code{"g"} = "--.";
+				$code{"h"} = "....";
+				$code{"i"} = "..";
+				$code{"j"} = ".---";
+				$code{"k"} = "-.-";
+				$code{"l"} = ".-..";
+				$code{"m"} = "--";
+				$code{"n"} = "-.";
+				$code{"o"} = "---";
+				$code{"p"} = ".--.";
+				$code{"q"} = "--.-";
+				$code{"r"} = ".-.";
+				$code{"s"} = "...";
+				$code{"t"} = "-";
+				$code{"u"} = "..-";
+				$code{"v"} = "...-";
+				$code{"w"} = ".--";
+				$code{"x"} = "-..-";
+				$code{"y"} = "-.--";
+				$code{"z"} = "--..";
+				$code{"0"} = "-----";
+				$code{"1"} = ".----";
+				$code{"2"} = "..---";
+				$code{"3"} = "...--";
+				$code{"4"} = "....-";
+				$code{"5"} = ".....";
+				$code{"6"} = "-....";
+				$code{"7"} = "--...";
+				$code{"8"} = "---..";
+				$code{"9"} = "----.";
+				$code{","} = "--..--";
+				$code{"."} = ".-.-.-";
+				$code{":"} = "---...";
+				$code{"?"} = "..--..";
+				$code{"'"} = ".----.";
+				$code{"-"} = "-...-";
+				$code{" "} = "/";
+
+				my @chars = split(//,$msg);
+				my $msg2 = "";
+				foreach $char (@chars) {
+					if (exists $code{$char}) {
+						$char = $code{$char};
+					}
+
+					$msg2 .= "$char ";
+				}
+
+				print S "$msg2\n";
+			} elsif ($line =~ /^\/demorse/) {
+				$line =~ s/\n//g;
+
+				$line =~ /^(.*?) (.*)$/;
+				my $cmd = $1;
+				my $msg = $2;
+
+				my %code;
+				$code{".-"} = "a";
+				$code{"-..."} = "b";
+				$code{"-.-."} = "c";
+				$code{"-.."} = "d";
+				$code{"."} = "e";
+				$code{"..-."} = "f";
+				$code{"--."} = "g";
+				$code{"...."} = "h";
+				$code{".." } = "i";
+				$code{".---"} = "j";
+				$code{"-.-"} = "k";
+				$code{".-.."} = "l";
+				$code{"--"} = "m";
+				$code{"-."} = "n";
+				$code{"---"} = "o";
+				$code{".--."} = "p";
+				$code{"--.-"} = "q";
+				$code{".-."} = "r";
+				$code{"..."} = "s";
+				$code{"-"} = "t";
+				$code{"..-"} = "u";
+				$code{"...-"} = "v";
+				$code{".--"} = "w";
+				$code{"-..-"} = "x";
+				$code{"-.--"} = "y";
+				$code{"--.."} = "z";
+				$code{"-----"} = "0";
+				$code{".----"} = "1";
+				$code{"..---"} = "3";
+				$code{"...--"} = "3";
+				$code{"....-"} = "4";
+				$code{"....."} = "5";
+				$code{"-...."} = "6";
+				$code{"--..."} = "7";
+				$code{"---.."} = "8";
+				$code{"----."} = "9";
+				$code{"--..--"} = ",";
+				$code{".-.-.-"} = ".";
+                                $code{"---..."} = ":";
+                                $code{"..--.."} = "?";
+                                $code{".----."} = "'";
+                                $code{"-...-"} = "-";
+				$code{"/"} = " ";
+
+				my @chars = split(/ /,$msg);
+				my $msg2 = "";
+				foreach $char (@chars) {
+					if (exists $code{$char}) {
+						$char = $code{$char};
+					}
+
+					$msg2 .= "$char";
+				}
+
+				print "tr: $msg2\n";
+			} else {
+				print S $line;
+			}
+		}
+		&dokill();
+	} else {
+		while(<S>) {
+			if ($term == 0) {
+				print;
+			} else {
+				$line = $_;
+				(@line) = split(//,$line);
+				$num = 0;
+				foreach $char (@line) {
+					$num++;
+					print $char;
+					if ($num % 25 == 0) {
+						print "\n";
+					}
+				}
+			}
+			if ($logging) {
+				print LOG;
+			}
+		}
+		kill(2,$mypid);
+	}
+
+	if ($logging) {
+		close(LOG);
+	}
+}

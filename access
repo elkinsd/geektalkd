@@ -1,0 +1,182 @@
+#!/usr/bin/perl -w
+
+use strict 'vars';
+use vars qw($allow $deny $aclfile %handles);
+
+# ***  checkDomain  ***
+# Checks to see if a hostnmae is on the specified list (either allow or
+# deny).
+sub checkDomain {
+	my($host, $list) = @_;
+	return 1 if($list->{all} == 1);
+	my $nametest;
+	foreach $nametest (keys %{$list->{domain}}) {
+		if($nametest !~ /^\./) {
+			return 1 if($host eq $nametest);
+		}
+		$nametest = "." . $nametest;
+		$nametest =~ s/\./\\\./g;
+		return 1 if($host =~ /$nametest$/);
+	}
+	return 0;
+}
+
+# ***  checkIP  ***
+# Checks to see if an IP address is on the specified list (either allow or
+# deny).
+sub checkIP {
+	my($ip, $list) = @_;
+	return 1 if($list->{all} == 1);
+	my $ipparts;
+	my $iptest;
+	foreach $iptest (keys %{$list->{ip}}) {
+		if(split(/\./, $iptest) == 4) {
+			return 1 if($ip eq $iptest);
+		} else {
+			$iptest .= "." if($iptest !~ /\.$/);
+			$iptest =~ s/\./\\\./g;
+			return 1 if($ip =~ /^$iptest/);
+		}
+	}
+	return 0;
+}
+
+# ***  checkIPSyntax  ***
+# Verifies that the passed ip address is valid.
+sub checkIPSyntax {
+	my $ip = shift;
+	my @ipparts = split /\./, $ip;
+	return "Invalid ip address: only 4 octets allowed." if($#ipparts > 3);
+	foreach(0..$#ipparts) {
+		if($ipparts[$_] > 255) {
+			return "Each octet must be between 0 and 255 inclusive.";
+		}
+	}
+	return 1;
+}
+
+# ***  checkList  ***
+# Check to see if the passed IP address is on the passed list (either allow or
+# deny).
+sub checkList {
+	my($iaddr, $list) = @_;
+	my $result;
+	my $ip = inet_ntoa($iaddr);
+	$result = checkIP($ip, $list);
+	return 1 if($result == 1);
+	my $hostname = gethostbyaddr($iaddr,AF_INET);
+	$result = checkDomain($hostname, $list);
+	return $result;
+}
+
+# ***  insertAccess  ***
+# Reads a domain/ip, makes sure its valid, and inserts it into the specified
+# hash (which should be "allow" or "deny").
+sub insertAccess {
+	my($domain, $list) = @_;
+	my $result;
+	if($domain =~ /^all$/i) {
+		$$list->{all} = 1;
+	} elsif($domain =~ /^[\d\.]+$/) {
+		$result = checkIPSyntax($domain);
+		return $result if($result != 1);
+		$$list->{ip}{$domain} = 1;
+	} elsif($domain =~ /^[\w\-\.]+$/) {
+		$$list->{domain}{$domain} = 1;
+	} else {
+		return "Invalid domain name: $domain";
+	}
+	return 1;
+}
+
+# ***  parseAccessFile()  ***
+# Reads in the Access Control List from a file.
+sub parseAccessFile {
+	open(ACL, $aclfile) or return "Couldn't open access file $aclfile: $!";
+	my $oldallow = $allow;
+	my $olddeny = $deny;
+	$allow = {};
+	$deny = {};
+	my @result;
+	my $line = 0;
+	parse: while(<ACL>) {
+		++$line;
+		next parse if(/^#/ || /^\s*$/);
+		@result = parseAccessLine($_);
+		if($result[0] != 1) {
+			unshift @result, "Error in access file $aclfile line $line:";
+			$allow = $oldallow;
+			$deny = $olddeny;
+			return @result;
+		}
+	}
+	close ACL;
+	removeForbiddenUsers();
+	return 1;
+}
+
+# ***  parseAccessLine()  ***
+# Parses a single line of access control information.
+sub parseAccessLine {
+	my $line = shift;
+	my @line = split ' ', $line, 2;
+	my $domain;
+	my @domainparts;
+	if($line[0] eq "allow" || $line[0] eq "deny") {
+		return(parseHostsLine($line[0], $line[1]));
+	} else {
+		return("Invalid command in access file: $line[0]");
+	}
+}
+
+# **  parseHostsLine  **
+# Parses an /^(allow|deny)/ line.  Pass it either "allow" or "deny" as the first
+# argument, and the rest of the line as the second argument.
+sub parseHostsLine {
+	my $acltype = shift;
+	my $line = shift;
+	my @line = split ' ', $line;
+	my $from = shift @line;
+	if($from !~ /^from$/i) {
+		return "allow requires at least two arguments, 'from' followed by "
+					."hostnames or IP-address wildcards";
+	}
+	my($result, $domain);
+	foreach $domain (@line) {
+		$result = insertAccess($domain, $acltype);
+		if($result != 1) {
+			return $result;
+		}
+	}
+	return 1;
+}
+
+# ***  removeForbiddenUsers()  ***
+# Check every user in %handles and remove them if they are not allowed
+# (called from parseAccessFile to remove deadbeats when access rules change)
+sub removeForbiddenUsers() {
+	my $rmvmsg = 0;
+	foreach my $handle (keys %handles) {
+		my @ip = split /\./, $handles{$handle}{ipaddr};
+		my $iaddr = pack("C4",$ip[0],$ip[1],$ip[2],$ip[3]);
+		if(!verifyHost($iaddr)) {
+			if($rmvmsg == 0) {
+				logmsg("ACCESS: Removing users who are forbidden",
+							"under the new access rules.");
+				$rmvmsg = 1;
+			}
+			removeHandle($handle);
+		}
+	}
+	logmsg("ACCESS: Finished removing forbidden users.") if($rmvmsg == 1);
+}
+
+# ***  verifyHost  ***
+# Check a passed hostname to see if it is allowed based on the access list.
+sub verifyHost {
+	my $iaddr = shift;
+	my $allowed = checkList($iaddr, $allow);
+	my $denied = checkList($iaddr, $deny);
+	return 1 if($allowed == 1 && $denied == 0);
+	return 0;
+}

@@ -1,0 +1,174 @@
+#!/usr/bin/perl
+
+$VERSION = '1.09';
+
+# module includes
+use Socket;
+use IO::Handle;
+
+$SIG{INT} = sub { exit };
+
+# process all the reloadable functions
+$Prefix = "/usr/local/geektalkd"; ## or use FindBin qw($RealBin);
+$DataDir = "/usr/local/geektalkd";
+$SysConfDir = "$DataDir";
+$SbinDir = "$Prefix";
+$LibExecDir = "$Prefix";
+
+do "$LibExecDir/functions";
+
+# set up some default variables
+$rehash = 0;
+$port = 41000;
+
+# Non-buffered output
+$| = 1;
+
+# ***Preliminary stuff
+options(); # read the options
+checkperm() if $codeon;
+openlog() if (defined $logging); # open the logfile if desired
+if(defined $access) {
+	do "$LibExecDir/access";
+	my @return = parseAccessFile();
+	if($return[0] != 1) {
+		foreach(@return) {
+			print "$_\n";
+		}
+		exit;
+	}
+}
+initstats(); # initialize some %stats-related variables
+startServer(); # begin listening for connections
+forkServer() if (!defined $debug); # launch into background
+setbits(); # set up $bits for use with select(2);
+
+# ***Main loop to run forever
+while(1) {
+	if($rehash == 1) {
+		# if something in processClients sets $rehash, we reload the functions
+		logmsg("SERVER: Rereading functions.");
+		eval do "$LibExecDir/functions";
+		if (defined $access) { eval do "$LibExecDir/access"; parseAccessFile(); }
+		if($@) { logmsg("Errors parsing functions!  Try 'perl -wc functions'"); }
+		$rehash = 0;
+	}
+	# keep runing processClients over and over to detect and process activity
+	processClients();
+}
+
+#####################
+# FUNCTIONS
+
+# ***  checkperm()  ***
+# Checks to see if the server is running unsecurely, and dies if it is.
+sub checkperm() {
+	return if(defined $nopermcheck);
+	if(getpwuid($<) ne "nobody" || getpwuid($>) ne "nobody" ||
+				getgrgid($() !~ /^no/ || getgrgid($)) !~ /^no/) {
+		print STDERR "\nWARNING: your userid or groupid may not be secure!!!\n\n";
+		print STDERR "geektalkd should not ever be run as anything except\n";
+		print STDERR "\"nobody\" when the /code command is enabled because it\n";
+		print STDERR "allows arbitrary code to be run by unauthenticaed users.\n";
+		print STDERR "You can use the -r option to override this check.\n\n";
+		exit;
+	}
+}
+
+# ***  forkServer  ***
+# Forks the server to the background.
+sub forkServer {
+	my $pid;
+	if(!defined($pid = fork)) {
+		die "cannot fork: $!";
+	} elsif($pid) {
+		logmsg("SERVER: Forked off $pid.");
+		exit;
+	}
+}
+
+# ***  openlog()  ***
+# Open the log file.
+sub openlog {
+	open(LOG, ">>$logfile") or die "Couldn't open $logfile: $!";
+	LOG->autoflush();
+}
+
+# ***  options()  ***
+# Read and process the command line options.
+sub options {
+	my $option;
+	while(my $option = shift(@ARGV)) {
+		if($option eq "-l") {
+			$logging = 1;
+			$logfile = shift(@ARGV);
+			if(!defined $logfile) {
+				print STDERR "Invalid log file.\n\n";
+				usage();
+			}
+		} elsif($option eq "-a") {
+			$access = 1;
+			$aclfile = shift(@ARGV);
+			if(!defined $aclfile) {
+				print STDERR "Invalid access file.\n\n";
+				usage();
+			}
+		} elsif($option eq "-d") {
+			$debug = 1;
+		} elsif($option eq "-p") {
+			$option = shift @ARGV;
+			if($option =~ /^\d+$/ && $option > 0 && $option < 65535) {
+				$port = $option;
+			} else {
+				print STDERR "Invalid port \"$option\".\n\n";
+				usage();
+			}
+		} elsif($option eq "-h") {
+			usage();
+		} elsif($option eq "-r") {
+			$nopermcheck = 1;
+		} elsif($option eq "-c") {
+			$codeon = 1;
+		} elsif($option eq "-V") {
+			print STDERR "geektalkd version $VERSION\n";
+			print STDERR "Copyright (C) 1999-2003 Michael Plump " . "<plumpy\@skylab.org>\n";
+			print STDERR "Copyright (C) 1999-2014 David Elkins " . "<elkinsd\@hurrah.com>\n";
+			exit;
+		} else {
+			print STDERR "Invalid option \"$option\".\n\n";
+			usage();
+		}
+	}
+}
+
+# ***  startServer()  ***
+# Set up server connection options and start listening
+sub startServer {
+	socket(Server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!";
+	setsockopt(Server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
+	bind(Server, sockaddr_in($port, INADDR_ANY)) or die "bind: $!";
+	listen(Server,SOMAXCONN) or die "listen: $!";
+	logmsg("SERVER: listening on port $port.");
+	return 1;
+}
+
+# ***  usage()  ***
+# Print the standard usage message and exit.
+sub usage {
+	print STDERR "geektalkd [-a] [-c] [-d] [-h] [-l <logfile>] [-p <port>] ";
+	print STDERR "[-r] [-V]\n";
+	print STDERR "   -a <accessfile>: Enable access control.  This uses ";
+	print STDERR "apache-style\n       control.  See the server documentation.\n";
+	print STDERR "   -c: Enable the /code feature, which allows arbitrary code ";
+	print STDERR "to be\n       run.  This is dangerous, and not of much use ";
+	print STDERR "unless you know\n       the server's codebase pretty well";
+	print STDERR "well, so it's off by default.\n       Make sure to change the";
+	print STDERR " password in the 'functions' file if\n       you use this!\n";
+	print STDERR "   -d: Debug mode.  Logs to stderr and won't fork.\n";
+	print STDERR "   -h: Prints this message and exits.\n";
+	print STDERR "   -l <logfile>: Logging enabled.\n";
+	print STDERR "   -p <port>: Sets the port that the server will run on.\n";
+	print STDERR "   -r: Allows the server to be run regardless of uid/gid.\n";
+	print STDERR "   -V: Prints version information and exits.\n";
+	exit;
+}
